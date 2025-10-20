@@ -1,0 +1,204 @@
+version: '3.8'
+
+services:
+  # ----------------------------------------------------
+  # Zookeeper & Kafka (From Original Proposal)
+  # ----------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.2
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
+    networks:
+      - starrocks-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.2
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - starrocks-net
+
+  # ----------------------------------------------------
+  # MySQL (From Original Proposal, adapted)
+  # ----------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-password} # Use .env file
+      MYSQL_DATABASE: 'testdb'
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks:
+      - starrocks-net
+
+  # ----------------------------------------------------
+  # StarRocks Cluster (From Your Provided Config)
+  # ----------------------------------------------------
+  starrocks-fe:
+    image: starrocks/allin1-ubuntu:3.5-latest
+    container_name: starrocks-fe
+    hostname: starrocks-fe
+    ports:
+      - "8030:8030"
+      - "9030:9030"
+      - "9020:9020"
+    command:
+      - /bin/bash
+      - -c
+      - |
+        echo "run_mode = shared_nothing" >> /data/deploy/starrocks/fe/conf/fe.conf
+        /data/deploy/starrocks/fe/bin/start_fe.sh
+    volumes:
+      - fe-meta:/data/deploy/starrocks/fe/meta
+      - ./fe_log:/data/deploy/starrocks/fe/log
+    healthcheck:
+      test: 'mysql -u root -h starrocks-fe -P 9030 -e "show frontends\G" |grep "Alive: true"'
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - starrocks-net
+
+  starrocks-be1:
+    image: starrocks/allin1-ubuntu:3.5-latest
+    container_name: starrocks-be1
+    depends_on:
+      starrocks-fe:
+        condition: service_healthy
+        restart: true
+    command: 
+      - /bin/bash
+      - -c
+      - |
+        sleep 15s;
+        ulimit -u 65535;
+        ulimit -n 65535;
+        mysql --connect-timeout 2 -h starrocks-fe -P9030 -uroot -e "ALTER SYSTEM ADD BACKEND \"starrocks-be1:9050\";"
+        /data/deploy/starrocks/be/bin/start_be.sh
+    volumes:
+      - be1-storage:/data/deploy/starrocks/be/storage
+      - ./be1_log:/data/deploy/starrocks/be/log
+    ports:
+      - 8040:8040
+    healthcheck:
+         test: 'mysql -u root -h starrocks-fe -P 9030 -e "SHOW backends\G" |grep "Alive: true"'
+         interval: 10s
+         timeout: 5s
+         retries: 3
+    networks:
+      - starrocks-net
+
+  starrocks-be2:
+    image: starrocks/allin1-ubuntu:3.5-latest
+    container_name: starrocks-be2
+    depends_on:
+      starrocks-fe:
+        condition: service_healthy
+        restart: true
+    command: 
+      - /bin/bash
+      - -c
+      - |
+        sleep 15s;
+        ulimit -u 65535;
+        ulimit -n 65535;
+        mysql --connect-timeout 2 -h starrocks-fe -P9030 -uroot -e "ALTER SYSTEM ADD BACKEND \"starrocks-be2:9050\";"
+        /data/deploy/starrocks/be/bin/start_be.sh
+    volumes:
+        # Persist the data to disk if needed
+      - be2-storage:/data/deploy/starrocks/be/storage
+      - ./be2_log:/data/deploy/starrocks/be/log
+    ports:
+      - 8041:8040
+    healthcheck:
+      test: 'mysql -u root -h starrocks-fe -P 9030 -e "SHOW backends\G" |grep "Alive: true"'
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - starrocks-net
+
+  # ----------------------------------------------------
+  # Flink Cluster (From Original Proposal, adapted)
+  # ----------------------------------------------------
+  flink-jobmanager:
+    image: flink:1.18.1-scala_2.12
+    container_name: flink-jobmanager
+    ports:
+      - "8081:8081"
+    command:
+      - /bin/bash 
+      - -c
+      - |
+        wget https://repo1.maven.org/maven2/com/starrocks/flink-connector-starrocks/1.2.10_flink-1.18/flink-connector-starrocks-1.2.10_flink-1.18.jar -P /opt/flink/lib/
+        /docker-entrypoint.sh jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+    volumes:
+      - ./cdc-producer-service/target:/opt/flink/usrlib/producer
+      - ./scd2-consumer-service/target:/opt/flink/usrlib/consumer
+    networks:
+      - starrocks-net
+
+  flink-taskmanager:
+    image: flink:1.18.1-scala_2.12
+    container_name: flink-taskmanager
+    depends_on:
+      - flink-jobmanager
+    command:
+      - /bin/bash 
+      - -c
+      - |
+        wget https://repo1.maven.org/maven2/com/starrocks/flink-connector-starrocks/1.2.10_flink-1.18/flink-connector-starrocks-1.2.10_flink-1.18.jar -P /opt/flink/lib/
+        /docker-entrypoint.sh taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+    networks:
+      - starrocks-net
+
+# ----------------------------------------------------
+# Shared Network & Volumes
+# ----------------------------------------------------
+networks:
+   starrocks-net:
+      driver: bridge
+
+volumes:
+   zookeeper-data:
+   zookeeper-log:
+   kafka-data:
+   mysql-data:
+   fe-meta:
+   be1-storage:
+   be2-storage:
